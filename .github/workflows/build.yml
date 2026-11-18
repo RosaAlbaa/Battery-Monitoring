@@ -1,0 +1,90 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -q tests
+
+      - name: Read version
+        id: ver
+        run: |
+          $v = (python -c "import battery_monitoring; print(battery_monitoring.__version__)").Trim()
+          if ($env:GITHUB_REF -like 'refs/tags/v*' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            Write-Error "Tag $env:GITHUB_REF_NAME does not match __version__ ($v) in battery_monitoring/__init__.py."
+            exit 1
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: PyInstaller (folder for the installer)
+        run: >
+          pyinstaller --noconfirm --clean --windowed --onedir
+          --name BatteryMonitoring --icon assets/battery_monitoring.ico
+          --hidden-import pystray._win32
+          battery_monitoring.pyw
+
+      - name: PyInstaller (portable single .exe)
+        run: >
+          pyinstaller --noconfirm --clean --windowed --onefile
+          --name BatteryMonitoring-portable --icon assets/battery_monitoring.ico
+          --hidden-import pystray._win32
+          battery_monitoring.pyw
+
+      - name: Build installer (Inno Setup)
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" installer\battery_monitoring.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Collect release files
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item "dist\BatteryMonitoring-Setup-$v.exe" release\
+          Copy-Item "dist\BatteryMonitoring-portable.exe" "release\BatteryMonitoring-$v-portable.exe"
+          Get-ChildItem release\*.exe | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content -Encoding ascii release\SHA256SUMS.txt
+          Get-Content release\SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BatteryMonitoring-${{ steps.ver.outputs.version }}
+          path: release/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Battery Monitoring ${{ steps.ver.outputs.version }}
+          files: release/*
+          generate_release_notes: true
+          body: |
+            **Install:** download `BatteryMonitoring-Setup-${{ steps.ver.outputs.version }}.exe` and run it. No admin rights needed.
+            **Portable:** `BatteryMonitoring-${{ steps.ver.outputs.version }}-portable.exe` runs without installing.
+
+            The files are not code-signed, so Windows SmartScreen may warn you: **More info → Run anyway**. SHA256 checksums are in `SHA256SUMS.txt`.
